@@ -4,7 +4,7 @@ opencode 原生冷 agent 对抗性审阅:会话产出"重要结论"时,自动建
 
 - **适用**:无 root 的 Linux 服务器,给你自己的所有 opencode 会话用
 - **冷审阅方式**:opencode 原生新 session(`session.create` + `session.prompt`)
-- **核对依据**:2026-08 opencode dev 分支生成类型 + 源码(经三轮 review 核实)。服务器上以 `node_modules/@opencode-ai/sdk` 实际安装版本的类型为准
+- **核对依据**:2026-08 opencode dev 分支生成类型 + 源码(经四轮 review 核实)。服务器上以 `node_modules/@opencode-ai/sdk` 实际安装版本的类型为准
 
 ---
 
@@ -98,7 +98,7 @@ ls ~/.local/share/opencode/sessions/ 2>/dev/null | wc -l   # 仅作可能路径�
 
 ---
 
-## 三、观察项(DS review 收敛后仅剩这 2 个,源码已定的无需实测)
+## 三、观察项(经多轮 review 收敛后仅剩这 2 个,源码已定的无需实测)
 
 ### 观察项 1:`session.create` 缺省 directory
 代码里 `reviewDirectory` 默认 `undefined`(不传 `query.directory`)。**实测确认**:建出的冷 session 的 `session.directory` 是否 = 当前项目目录。
@@ -195,7 +195,7 @@ find ~/.cache/opencode ~/.config/opencode -path '*@opencode-ai/sdk*/dist/client.
 
 ## 八、核对清单(交付时记录)
 
-**源码已定(三轮 review 核实):**
+**源码已定(四轮 review 核实):**
 - [x] 按 2026-08 opencode dev 分支生成类型核对(服务器以实际版本为准)
 - [x] `tools:{"*":false}` 禁用工具(非 `tools:{}`,后者是 no-op)
 - [x] `system` 追加语义(非覆盖,排 AGENTS.md 之后)

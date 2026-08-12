@@ -1,0 +1,13 @@
+# 统一文本文件换行为 LF,避免跨平台协作时的 CRLF diff 噪音
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.txt  text eol=lf
+LICENSE text eol=lf
+.gitignore text eol=lf
+
+# 二进制不做换行处理
+*.png binary
+*.jpg binary
+*.pdf binary

@@ -7,7 +7,7 @@
 // 冷审阅全程用 opencode 原生 session.create + session.prompt,不 spawn 任何
 // 外部 CLI。部署只需把本文件放到 ~/.config/opencode/plugins/ (无 root)。
 //
-// 核对依据:2026-08 opencode dev 分支生成类型 + 源码(经三轮 review 核实)。
+// 核对依据:2026-08 opencode dev 分支生成类型 + 源码(经四轮 review 核实)。
 // 服务器上以 node_modules/@opencode-ai/sdk 实际安装版本的类型为准。
 //
 // 已核实的源码事实(见 README-DEPLOY.md "观察项"):
@@ -96,7 +96,7 @@ export default async function AdvReview({ client }) {
     const conclusionWords = ["决定", "最终", "结论", "建议", "方案", "上线", "recommend", "should", "plan", "decision", "conclusion"];
     const minFences = 2;
     // 中文词原样匹配;英文词加 \b 词边界,挡住子串误匹配(如 "running" 含 "run")。
-    // 注:DS 指出 "will" 过弱("OK, will do." 也会触发),已从结论词移除。
+    // 注:"will" 过弱("OK, will do." 也会触发),已从结论词移除(早期 review 指出)。
     const hasConcl = (txt) =>
       conclusionWords.some((w) => {
         const re = /[A-Za-z]/.test(w) ? new RegExp("\\b" + w + "\\b", "i") : new RegExp(w, "i");
