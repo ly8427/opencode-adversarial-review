@@ -130,17 +130,14 @@ export default async function AdvReview({ client }) {
     return { pass: true };
   };
 
-  // --- 带超时的审阅 prompt;超时则 abort ---
-  const promptWithTimeout = async (reviewSessionID, body) => {
-    let timer;
-    const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error("review timeout")), CONFIG.reviewTimeoutMs);
-    });
+  // --- 带超时 + 真取消的 prompt(审阅 & 注入共用) ---
+  // AbortController:signal 透传给 client.session.prompt 的底层 fetch,超时 controller.abort() 真取消。
+  // (旧实现用 Promise.race:超时只放弃等待、不取消 fetch → 连接泄漏。)
+  const promptWithTimeout = async (id, body) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), CONFIG.reviewTimeoutMs);
     try {
-      return await Promise.race([
-        client.session.prompt({ path: { id: reviewSessionID }, body }),
-        timeout,
-      ]);
+      return await client.session.prompt({ path: { id }, body, signal: controller.signal });
     } finally {
       clearTimeout(timer);
     }
@@ -264,9 +261,10 @@ export default async function AdvReview({ client }) {
               ...(CONFIG.reviewModel ? { model: CONFIG.reviewModel } : {}),
             });
           } catch (e) {
-            // 审阅超时/失败:abort 审阅 session,本次跳过
+            // 审阅超时/失败:fire-and-forget abort 服务端轮(不 await —
+            // await 在挂起时不返回 → finally 延迟 → inFlight 锁死。controller.abort 已取消客户端 fetch)
             log("review failed/timeout:", e?.message || String(e));
-            try { await client.session.abort({ path: { id: reviewSessionID } }); } catch {}
+            client.session.abort({ path: { id: reviewSessionID } }).catch(() => {});
             return;
           }
 
@@ -282,13 +280,18 @@ export default async function AdvReview({ client }) {
           }
 
           // ===== 注入回原 session =====
-          // 先注入,成功后用返回的 assistant.parentID(=触发它的 user 消息 id)记入 justInjected
-          const injectResp = await client.session.prompt({
-            path: { id: sid },
-            body: {
+          // 注入也是完整 LLM 轮(触发 assistant 续写),用 promptWithTimeout 封顶(现含真取消)。
+          // 失败则 fire-and-forget abort sid(不 await,同审阅超时,避免挂起卡 finally)。
+          let injectResp;
+          try {
+            injectResp = await promptWithTimeout(sid, {
               parts: [{ type: "text", text: "【对抗性审阅】\n" + reviewText, synthetic: true }],
-            },
-          });
+            });
+          } catch (e) {
+            log("inject failed/timeout, fire-and-forget abort sid:", sid, e?.message || String(e));
+            client.session.abort({ path: { id: sid } }).catch(() => {});
+            return;
+          }
           const triggerParentID = injectResp.data?.info?.parentID;
           if (triggerParentID) justInjected.set(sid, triggerParentID);
           log("review injected into", sid, `(${reviewText.length} chars, parentID=${triggerParentID})`);
