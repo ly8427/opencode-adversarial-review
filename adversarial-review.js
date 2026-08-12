@@ -255,7 +255,7 @@ export default async function AdvReview({ client }) {
           const injectResp = await client.session.prompt({
             path: { id: sid },
             body: {
-              parts: [{ type: "text", text: "【对抗性审阅】\n" + reviewText }],
+              parts: [{ type: "text", text: "【对抗性审阅】\n" + reviewText, synthetic: true }],
             },
           });
           const triggerParentID = injectResp.data?.info?.parentID;
