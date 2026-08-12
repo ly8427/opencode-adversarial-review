@@ -128,6 +128,17 @@ ls ~/.local/share/opencode/sessions/ 2>/dev/null | wc -l   # 仅作可能路径�
 | `reviewDirectory` | `undefined` | **实验选项**,见观察项 2。默认关闭 |
 | `reviewSystemPrompt` | 对抗性审阅者人设 | 作为 `prompt` 的 `system` 追加。可按需强化 |
 | `reviewTimeoutMs` | `300000` (5分钟) | 审阅 prompt 超时,超时则 abort 审阅 session,避免 inFlight 永久残留 |
+| `skipPattern` | `\[(skip\|noreview\|debug)\]` | **跳过控制**:标题或当前轮提词命中此正则 → 不审(见下) |
+
+### 跳过控制(per-session / per-turn)
+
+复用同一个 `skipPattern`,两个粒度:
+
+- **会话级**:给 session 标题加标记 → 该会话**全程**不审。如把调试会话命名为 `[debug] 排障`。
+- **单轮级**:在某一次提问里加标记 → **仅这一轮**不审。如 `快速看下这个 bug [noreview]`。
+
+默认匹配 `[skip]` / `[noreview]` / `[debug]`(方括号包裹,不区分大小写)。改标记词直接改 `skipPattern` 正则。
+
 
 改完重启 opencode 生效。
 

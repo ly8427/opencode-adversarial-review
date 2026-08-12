@@ -46,6 +46,12 @@ const CONFIG = {
 
   // 审阅 prompt 超时(毫秒)。超时则 abort 审阅 session 并清理,避免 inFlight 永久残留。
   reviewTimeoutMs: 5 * 60 * 1000,
+
+  // 【per-session / per-turn 控制】标题或当前轮用户提词命中此正则 → 跳过本次审阅。
+  //   会话级:给 session 标题加标记(如 "[debug] 排障")→ 该会话全程不审
+  //   单轮级:在某次提问里加标记(如 "快速看下这个bug [noreview]")→ 仅这一轮不审
+  // 改标记词直接改这个正则;默认匹配 [skip]/[noreview]/[debug]。
+  skipPattern: "\\[(skip|noreview|debug)\\]",
 };
 
 // =============================================================================
@@ -59,6 +65,9 @@ const CONFIG = {
 //   不匹配 → 新一轮用户结论,清标记继续审。
 //   (parentID = 触发 assistant 的那条 user 消息 id,源码 prompt.ts: parentID = lastUser.id)
 //   比对法即使双事件/事件乱序也绝不会误审续写回合,且不需要 TTL。
+// 预编译跳过标记正则(per-session/per-turn 控制)
+const SKIP_RE = new RegExp(CONFIG.skipPattern, "i");
+
 const selfCreated = new Set();
 const inFlight = new Set();
 const justInjected = new Map();
@@ -196,12 +205,29 @@ export default async function AdvReview({ client }) {
             return;
           }
 
+          // 会话级跳过:标题命中标记 → 该 session 全程不审
+          if (session.title && SKIP_RE.test(session.title)) {
+            log("skip by title marker:", sid, session.title);
+            return;
+          }
+
           // 拉消息,取最后一条 assistant 文本(数组升序,末尾是最新)
           const msgsResp = await client.session.messages({ path: { id: sid } });
           const msgs = msgsResp.data || [];
           const lastAssistant = [...msgs].reverse().find((m) => m.info.role === "assistant");
           const text = extractAssistantText(lastAssistant);
           if (!text) return;
+
+          // 单轮级跳过:当前轮用户提词命中标记 → 仅这一轮不审
+          //   (排除 synthetic:我们注入的审阅不算用户提词)
+          const lastUserEntry = [...msgs].reverse().find((m) => m.info.role === "user");
+          const lastUserText = lastUserEntry
+            ? lastUserEntry.parts.filter((p) => p.type === "text" && !p.synthetic && !p.ignored).map((p) => p.text).join("\n").trim()
+            : "";
+          if (lastUserText && SKIP_RE.test(lastUserText)) {
+            log("skip by prompt marker:", sid);
+            return;
+          }
 
           // Layer 1 本地过滤(零成本)
           const fr = localFilter(text);
