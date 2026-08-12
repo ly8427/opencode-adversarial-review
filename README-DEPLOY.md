@@ -230,6 +230,9 @@ find ~/.cache/opencode ~/.config/opencode -path '*@opencode-ai/sdk*/dist/client.
 
 ## 九、已知边界(v1 接受,不阻塞部署)
 
-1. **注入 prompt 无超时**:`reviewTimeoutMs` 只覆盖冷审阅 prompt,不覆盖"注入回原 session 后等 agent 回应审阅"这段时间。若该回合 agent 卡住(等权限确认/模型挂起),`inFlight` 会长驻直到该 session 下一个 idle。**v1 可接受**:会话本来就在忙,期间不存在可被漏审的 idle,不会造成循环,只是标记停留较久。
+1. **注入与审阅均已封顶超时**:`reviewTimeoutMs` 同时覆盖冷审阅 prompt 和注入 prompt(两者都走 `promptWithTimeout`,超时 `controller.abort()` 真取消 fetch)。超时/失败路径用 fire-and-forget abort,不 `await`(避免 abort 自身挂起卡住 finally/inFlight)。
 2. **compaction 场景的 parentID 误判**:若审阅续写回合期间触发了上下文压缩(compaction),会插入新 ID 的合成消息,导致续写回合的"最后一条 user 消息 id"不再等于记录的 parentID → 标记被清 → 可能把续写当新结论多审一次。**后果仅单次多余审阅,不形成循环**(下一轮注入会重新建立标记)。低频场景,v1 不修。
 3. **`triggerEvent` 二选一的版本依赖**:默认 `session.status`,若你的 opencode 版本不发该事件需改 `session.idle`。两者不可同开(见故障排查"循环")。
+4. **冷审阅窗口内的交错(错位已治,漏审未治)**:冷审阅跑在独立 session,耗时几十秒。若用户在此窗口内又发新消息 M,有两个后果——
+   - **错位注入(已治)**:针对旧结论 C 的审阅不会错位打到 M 的上下文。注入前会比对"最后一条 user 消息 id"是否还是触发本次审阅的那个,变了就放弃注入(日志 `skip inject: user moved on during review`)。
+   - **M 的结论漏审(未治,已知边界)**:M 那次 idle 会撞上 `inFlight`(防重入)被挡掉,且 inFlight 释放后不会回头补审。这是 `inFlight` 防并发双触发(防死循环)的固有代价——选了防死循环(更严重),代价是窗口内的新结论偶尔漏一次。要彻底消除需队列化审阅请求,复杂度暴涨,不值。实际撞到概率低(用户通常等审阅注入完再继续);若常撞,缓解办法是缩短冷审阅窗口(更快模型/更短 prompt)。

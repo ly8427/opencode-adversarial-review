@@ -226,6 +226,10 @@ export default async function AdvReview({ client }) {
             return;
           }
 
+          // 记下触发本次审阅的 user 消息 id:注入前要比对它,若用户在冷审阅窗口内发了新消息
+          // (最后一条 user 变了)→ 放弃注入,避免"针对旧结论 C 的审阅错位打到新消息 M 上下文"。
+          const triggerUserID = lastUserEntry ? lastUserEntry.info.id : null;
+
           // Layer 1 本地过滤(零成本)
           const fr = localFilter(text);
           if (!fr.pass) {
@@ -280,6 +284,18 @@ export default async function AdvReview({ client }) {
           }
 
           // ===== 注入回原 session =====
+          // 先治"错位":若冷审阅窗口内用户发了新消息(最后一条 user id ≠ triggerUserID),
+          // 放弃本次注入——避免针对旧结论 C 的审阅错位打到新消息 M 的上下文。
+          // (注意:这只治错位,救不回"M 的结论被 inFlight 防重入挡掉漏审"——那是已知边界。)
+          {
+            const recheck = await client.session.messages({ path: { id: sid } });
+            const nowLastUser = [...(recheck.data || [])].reverse().find((m) => m.info.role === "user");
+            if (triggerUserID && nowLastUser && nowLastUser.info.id !== triggerUserID) {
+              log("skip inject: user moved on during review (stale conclusion)", sid);
+              return;
+            }
+          }
+
           // 注入也是完整 LLM 轮(触发 assistant 续写),用 promptWithTimeout 封顶(现含真取消)。
           // 失败则 fire-and-forget abort sid(不 await,同审阅超时,避免挂起卡 finally)。
           let injectResp;
