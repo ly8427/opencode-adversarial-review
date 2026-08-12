@@ -66,7 +66,7 @@ const justInjected = new Map();
 // =============================================================================
 // plugin 主体
 // =============================================================================
-export default async function AdvReview({ client }) {
+export default async function AdvReview({ client, directory }) {
   // 日志:app.log 必填 service+level+message;await+catch 吞 promise rejection(不抛 unhandled)
   const log = (...args) => {
     const line = "[adv-review] " + args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
@@ -261,6 +261,14 @@ export default async function AdvReview({ client }) {
           const triggerParentID = injectResp.data?.info?.parentID;
           if (triggerParentID) justInjected.set(sid, triggerParentID);
           log("review injected into", sid, `(${reviewText.length} chars, parentID=${triggerParentID})`);
+
+          // 注入的审阅文本会被 TUI 回填进 composer(输入框),用户得手动删。
+          // synthetic 在该版本未阻止回填,这里主动清空 composer。
+          // 双清:立即清一次 + 延迟再清一次,覆盖 TUI 在异步后续 tick 回填的时序。
+          const clearComposer = () => client.tui.clearPrompt(directory ? { query: { directory } } : {}).catch((e) => log("clearPrompt failed:", e?.message || String(e)));
+          // 都不 await:不阻塞 finally(inFlight 清理),让清空异步进行
+          clearComposer();
+          setTimeout(() => clearComposer(), 300);
         } finally {
           // 无论成败(含超时/失败 return 路径):清 in-flight;删除审阅 session 并从 Set 移除
           inFlight.delete(sid);
