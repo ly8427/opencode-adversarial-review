@@ -1,0 +1,25 @@
+# OS / 编辑器
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# 临时测试 / 验证脚本(交付物只有 plugin + README)
+test_*.mjs
+test_*.js
+*_test.*
+/tmp/
+
+# 日志
+*.log
+
+# 本地配置 / 凭据(防止误提交)
+.env
+.env.*
+*.key
+*.pem
+.credentials*
+opencode.json
