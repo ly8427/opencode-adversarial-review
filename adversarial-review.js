@@ -52,6 +52,12 @@ const CONFIG = {
   //   单轮级:在某次提问里加标记(如 "快速看下这个bug [noreview]")→ 仅这一轮不审
   // 改标记词直接改这个正则;默认匹配 [skip]/[noreview]/[debug]。
   skipPattern: "\\[(skip|noreview|debug)\\]",
+
+  // 【opt-in 白名单】设了才生效:设了之后,只有标题或当前轮提词命中此正则,才触发审阅;
+  // 否则即使重要结论也跳过(默认从"全审"切到"只在白名单内审")。与 skipPattern 共存:
+  // skip 优先(命中必跳),白名单是额外授权门。默认 undefined = 不启用(维持全审)。
+  // 例: reviewPattern: "review|important|\u5ba1\u4e00\u4e0b" → 只审标题/提词含这些词的。
+  reviewPattern: undefined,
 };
 
 // =============================================================================
@@ -67,6 +73,8 @@ const CONFIG = {
 //   比对法即使双事件/事件乱序也绝不会误审续写回合,且不需要 TTL。
 // 预编译跳过标记正则(per-session/per-turn 控制)
 const SKIP_RE = new RegExp(CONFIG.skipPattern, "i");
+// opt-in 白名单正则;reviewPattern 为 undefined 时不启用(REVIEW_RE=null,维持全审)
+const REVIEW_RE = CONFIG.reviewPattern ? new RegExp(CONFIG.reviewPattern, "i") : null;
 
 const selfCreated = new Set();
 const inFlight = new Set();
@@ -223,6 +231,13 @@ export default async function AdvReview({ client }) {
             : "";
           if (lastUserText && SKIP_RE.test(lastUserText)) {
             log("skip by prompt marker:", sid);
+            return;
+          }
+
+          // opt-in 白名单:设了 reviewPattern 时,标题或当前轮提词命中才审;
+          // 都不命中 → 跳过(默认从"全审"切到"白名单内审")。skip 优先级已在上面处理。
+          if (REVIEW_RE && !REVIEW_RE.test(session.title || "") && !REVIEW_RE.test(lastUserText)) {
+            log("skip: not in review whitelist", sid);
             return;
           }
 

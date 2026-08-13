@@ -129,6 +129,7 @@ ls ~/.local/share/opencode/sessions/ 2>/dev/null | wc -l   # 仅作可能路径�
 | `reviewSystemPrompt` | 对抗性审阅者人设 | 作为 `prompt` 的 `system` 追加。可按需强化 |
 | `reviewTimeoutMs` | `300000` (5分钟) | 审阅 prompt 超时,超时则 abort 审阅 session,避免 inFlight 永久残留 |
 | `skipPattern` | `\[(skip\|noreview\|debug)\]` | **跳过控制**:标题或当前轮提词命中此正则 → 不审(见下) |
+| `reviewPattern` | `undefined` | **白名单(opt-in)**:设了才生效。设了之后只有标题或当前轮提词命中此正则才审,否则跳过。默认 undefined=不启用(维持全审) |
 
 ### 跳过控制(per-session / per-turn)
 
@@ -138,6 +139,18 @@ ls ~/.local/share/opencode/sessions/ 2>/dev/null | wc -l   # 仅作可能路径�
 - **单轮级**:在某一次提问里加标记 → **仅这一轮**不审。如 `快速看下这个 bug [noreview]`。
 
 默认匹配 `[skip]` / `[noreview]` / `[debug]`(方括号包裹,不区分大小写)。改标记词直接改 `skipPattern` 正则。
+
+### 白名单控制(opt-in 模式)
+
+`skipPattern` 是 opt-out(默认全审,命中标记的跳过)。`reviewPattern` 是它的反面——**opt-in**:设了之后默认**不审**,只有标题或当前轮提词命中此正则,才触发审阅。
+
+- **未设 `reviewPattern`**(默认):维持现状,所有重要结论都审。
+- **设了 `reviewPattern`**:切换为"只在白名单内审"。例:`reviewPattern: "review|important|审一下"` → 只审标题或提词含这些词的会话/回合。
+
+**与 `skipPattern` 的关系**:`skip` 优先。两者共存时,先查 `skip`(命中必跳,黑名单),再查白名单(没授权跳过)。所以即使在白名单会话里,某轮提词带 `[noreview]` 仍可单轮跳过。
+
+**适用场景**:大部分时候不想要自动审阅(觉得吵/费钱),只在特定会话或特定回合显式标记才审。
+
 
 
 改完重启 opencode 生效。
