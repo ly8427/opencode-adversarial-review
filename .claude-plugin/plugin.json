@@ -1,0 +1,9 @@
+{
+  "name": "adversarial-review",
+  "version": "0.1.0",
+  "description": "冷代理对抗性审阅：主会话给出重要结论时，由无对话历史、无工具的独立审阅进程提出有依据的异议，主 Agent 必须逐条接受、反驳或标注待验证。手动命令默认可用；自动审阅（Stop 钩子）默认关闭，需在 .adversarial-review.json 配置 mode=auto 显式开启。",
+  "author": { "name": "ly8427" },
+  "homepage": "https://github.com/ly8427/opencode-adversarial-review",
+  "license": "MIT",
+  "keywords": ["adversarial-review", "review", "code-review", "second-opinion"]
+}
