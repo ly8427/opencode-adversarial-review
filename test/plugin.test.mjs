@@ -6,10 +6,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  answerHashOf, hash8, createTask, finishTask, decideReview,
+  answerHashOf, hash8, createTask, finishTask, decideReview, sweepStaleReviewing,
 } from "../adversarial-review.js";
 
-const CFG = { cooldownMs: 30 * 60 * 1000, failureCooldownMs: 5 * 60 * 1000 };
+const CFG = { cooldownMs: 30 * 60 * 1000, failureCooldownMs: 5 * 60 * 1000, reviewTimeoutMs: 120000 };
 const MIN = 60 * 1000;
 
 // ---------- answerHashOf(版本绑定键) ----------
@@ -154,4 +154,31 @@ test("decideReview: 内容不同(新哈希)立即放行——版本绑定语义"
   const recs = new Map([["h-old", { at: new Date().toISOString(), ok: true }]]);
   const r = decideReview(new Map(), recs, "h-new", CFG);
   assert.equal(r.review, true);
+});
+
+// ---------- sweepStaleReviewing(TTL 自愈,Bugbot(PR#2 High) 回归面) ----------
+test("sweepStaleReviewing: 新鲜 reviewing 不动;超 TTL 标 failed 并计数;损坏 startedAt 按 Infinity 扫掉", () => {
+  const tasks = new Map();
+  const fresh = createTask(tasks, { sessionId: "s1", answerHash: "h-fresh" });
+  const stale = createTask(tasks, { sessionId: "s2", answerHash: "h-stale" });
+  stale.startedAt = new Date(Date.now() - 5 * 60 * 1000).toISOString(); // ttl=120s+60s=180s
+  const broken = createTask(tasks, { sessionId: "s3", answerHash: "h-broken" });
+  broken.startedAt = "not-a-date";
+  const swept = sweepStaleReviewing(tasks, { reviewTimeoutMs: 120000 });
+  assert.equal(swept, 2);
+  assert.equal(fresh.status, "reviewing");
+  assert.equal(stale.status, "failed");
+  assert.match(stale.error, /stale/);
+  assert.equal(broken.status, "failed");
+});
+
+test("decideReview: reviewing 任务超 TTL 被清扫后同哈希放行(不再永久堵死)", () => {
+  const tasks = new Map();
+  const t = createTask(tasks, { sessionId: "s1", answerHash: "h" });
+  t.startedAt = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  const r1 = decideReview(tasks, new Map(), "h", CFG); // 清扫先行
+  assert.equal(r1.review, true);
+  assert.equal(t.status, "failed");
+  const r2 = decideReview(tasks, new Map(), "h", CFG); // 再判:failed 落无冷却记录 → 放行
+  assert.equal(r2.review, true);
 });

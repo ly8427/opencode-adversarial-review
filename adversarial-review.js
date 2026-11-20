@@ -149,9 +149,29 @@ export function finishTask(tasksMap, reviewedByHashMap, id, { status, error = nu
   return t;
 }
 
+// 陈旧在途清扫(src/core.mjs sweepStaleReviewing 同款;Bugbot(PR#2 High):create 失败
+// 等异常路径留下的 reviewing 行会把同哈希永久堵死,TUI 长进程必须有 TTL 自愈)
+export function sweepStaleReviewing(tasksMap, { reviewTimeoutMs }, now = Date.now()) {
+  const ttl = Math.max(reviewTimeoutMs || 120000, 60000) + 60000;
+  let swept = 0;
+  for (const t of tasksMap.values()) {
+    if (t.status !== "reviewing") continue;
+    const started = Date.parse(t.startedAt);
+    const age = Number.isFinite(started) ? now - started : Infinity;
+    if (age >= ttl) {
+      t.status = "failed";
+      t.error = "stale reviewing task (swept)";
+      t.finishedAt = new Date(now).toISOString();
+      swept++;
+    }
+  }
+  return swept;
+}
+
 // 去重/冷却(src/core.mjs shouldReview 同款):同哈希在审→跳;同哈希冷却期内 done→跳;
 // failed→短冷却跳;过期/损坏记录就地删除(内存有界)。返回 {review, reason?}。
-export function decideReview(tasksMap, reviewedByHashMap, hash, { cooldownMs, failureCooldownMs }, now = Date.now()) {
+export function decideReview(tasksMap, reviewedByHashMap, hash, { cooldownMs, failureCooldownMs, reviewTimeoutMs }, now = Date.now()) {
+  sweepStaleReviewing(tasksMap, { reviewTimeoutMs }, now); // 在途判定前先清陈旧(core.mjs 同序,幂等)
   for (const t of tasksMap.values()) {
     if (t.status === "reviewing" && t.answerHash === hash) {
       return { review: false, reason: "same answer in-flight" };
@@ -247,10 +267,13 @@ export default async function AdvReview({ client }) {
 
   // ===== 单轮审阅流程(事件体抽成可重入函数:DEBT #1③ 漏审治理需要"审完再审最新") =====
   const reviewLatest = async (sid) => {
-    // 【关键】inFlight 必须在任何 await 之前置位,堵住并发双触发的 TOCTOU 窗口
+    // 【关键】重入守卫必须与置位之间无 await(单线程 JS=原子)——事件路径与 recheck
+    // 路径共用本函数入口;Bugbot(PR#2 High): recheck 与并发 idle 双入会出两份冷审阅。
+    if (inFlight.has(sid)) return;
     inFlight.add(sid);
     let reviewSessionID; // 提升到外层,finally 才能在所有路径(含超时/失败 return)统一清理
     let recheckLatest = false; // 【DEBT #1③】审阅窗口内用户已前进 → finally 重触发"审最新"
+    let task = null; // Bugbot(PR#2 High): 异常路径(create 失败/未捕获抛)留下的 reviewing 任务必须在 finally 收尾
     try {
       // ② 防循环:刚注入审阅 → 比对 parentID,判断本轮 idle 是不是"审阅续写"
       if (justInjected.has(sid)) {
@@ -262,6 +285,18 @@ export default async function AdvReview({ client }) {
         if (lastUser && lastUser.info.id === injectedParentID) {
           // 这就是审阅触发的续写回合 → 跳过,但保留标记(下次新结论时再清)
           return;
+        }
+        if (injectedParentID === "inject-pending" && lastUser) {
+          // 【Bugbot(PR#2 Medium)】注入超时/失败不再 abort 用户会话 ⇒ 服务端仍可能
+          // 把注入轮跑完;其迟到 idle 若被当新结论=审"审阅的回复"=justInjected 本要
+          // 防的循环。哨兵落位:最后一条 user 是我们的 synthetic 注入 → 采纳其 id 为
+          // 正式标记,按续写回合处理;不是(用户已发新消息)→ 清哨兵正常审新结论。
+          const isOurInject = (lastUser.parts || []).some((p) => p.synthetic)
+            || (lastUser.parts || []).some((p) => p.type === "text" && (p.text || "").startsWith("【对抗性审阅】"));
+          if (isOurInject) {
+            justInjected.set(sid, lastUser.info.id);
+            return;
+          }
         }
         // 不是续写(用户发了新消息)→ 清标记,正常往下审
         justInjected.delete(sid);
@@ -334,7 +369,7 @@ export default async function AdvReview({ client }) {
       }
 
       // 【DEBT #1③】独立任务 ID:reviewing 起状态;同会话旧活跃任务被标记 superseded
-      const task = createTask(tasks, { sessionId: sid, answerHash: aHash, turn: triggerUserID });
+      task = createTask(tasks, { sessionId: sid, answerHash: aHash, turn: triggerUserID });
       log("task created:", task.id, "session", sid, "answer", hash8(aHash));
 
       // ===== 冷审阅:建新 session(无历史=冷) =====
@@ -406,6 +441,8 @@ export default async function AdvReview({ client }) {
         });
       } catch (e) {
         log("inject failed/timeout (no session.abort per DEBT#1①):", sid, e?.message || String(e));
+        // 【Bugbot(PR#2 Medium)】设哨兵接管迟到注入轮(见 justInjected 检查处的 isOurInject 分支)
+        justInjected.set(sid, "inject-pending");
         finishTask(tasks, reviewedByHash, task.id, { status: "failed", error: String(e?.message || e) });
         return;
       }
@@ -415,11 +452,23 @@ export default async function AdvReview({ client }) {
       log("review injected into", sid, `(task=${task.id}, answer=${hash8(aHash)}, ${reviewText.length} chars, parentID=${triggerParentID})`);
 
     } finally {
-      // 无论成败(含超时/失败 return 路径):清 in-flight;删除审阅 session 并从 Set 移除
-      inFlight.delete(sid);
+      // 无论成败(含超时/失败 return 路径):删审阅 session → 清 in-flight → 调度 recheck。
+      // 【Bugbot(PR#2 High)】顺序改动:先删 session(此间仍持 inFlight,不留无守卫窗口),
+      // 后清 inFlight,recheck 在清守卫之后调度——再叠加 reviewLatest 入口重入守卫双保险。
       if (reviewSessionID) {
-        try { await client.session.delete({ path: { id: reviewSessionID } }); } catch { /* ignore */ }
+        try {
+          await Promise.race([
+            client.session.delete({ path: { id: reviewSessionID } }),
+            new Promise((r) => setTimeout(r, 10000)), // 删除挂起不无限期占住 inFlight
+          ]);
+        } catch { /* ignore */ }
         selfCreated.delete(reviewSessionID);
+      }
+      inFlight.delete(sid);
+      // 【Bugbot(PR#2 High)】异常路径(create 失败/未捕获抛)留下的 reviewing 任务
+      // 会让 decideReview 把同哈希当在途——该答案整进程再不被审。落 failed 放行重审。
+      if (task && task.status === "reviewing") {
+        finishTask(tasks, reviewedByHash, task.id, { status: "failed", error: "abandoned (exception/timeout path)" });
       }
       // 【DEBT #1③】漏审治理:审阅窗口内用户前进 → 重触发一次"审最新"
       // (重触发经全部守卫:届时若 busy,其完成时的 idle 事件走正常路径;
