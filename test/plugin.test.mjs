@@ -161,7 +161,7 @@ test("sweepStaleReviewing: 新鲜 reviewing 不动;超 TTL 标 failed 并计数;
   const tasks = new Map();
   const fresh = createTask(tasks, { sessionId: "s1", answerHash: "h-fresh" });
   const stale = createTask(tasks, { sessionId: "s2", answerHash: "h-stale" });
-  stale.startedAt = new Date(Date.now() - 5 * 60 * 1000).toISOString(); // ttl=120s+60s=180s
+  stale.startedAt = new Date(Date.now() - 6 * 60 * 1000).toISOString(); // ttl=2×120s+60s=300s(Bugbot 二轮:覆盖 create+审阅+注入最坏时长)
   const broken = createTask(tasks, { sessionId: "s3", answerHash: "h-broken" });
   broken.startedAt = "not-a-date";
   const swept = sweepStaleReviewing(tasks, { reviewTimeoutMs: 120000 });
@@ -175,7 +175,7 @@ test("sweepStaleReviewing: 新鲜 reviewing 不动;超 TTL 标 failed 并计数;
 test("decideReview: reviewing 任务超 TTL 被清扫后同哈希放行(不再永久堵死)", () => {
   const tasks = new Map();
   const t = createTask(tasks, { sessionId: "s1", answerHash: "h" });
-  t.startedAt = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  t.startedAt = new Date(Date.now() - 6 * 60 * 1000).toISOString();
   const r1 = decideReview(tasks, new Map(), "h", CFG); // 清扫先行
   assert.equal(r1.review, true);
   assert.equal(t.status, "failed");

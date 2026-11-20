@@ -152,7 +152,10 @@ export function finishTask(tasksMap, reviewedByHashMap, id, { status, error = nu
 // 陈旧在途清扫(src/core.mjs sweepStaleReviewing 同款;Bugbot(PR#2 High):create 失败
 // 等异常路径留下的 reviewing 行会把同哈希永久堵死,TUI 长进程必须有 TTL 自愈)
 export function sweepStaleReviewing(tasksMap, { reviewTimeoutMs }, now = Date.now()) {
-  const ttl = Math.max(reviewTimeoutMs || 120000, 60000) + 60000;
+  // Bugbot(PR#2 Medium): 单次 reviewTimeoutMs 不够——管线=create+审阅 prompt+注入
+  // 各享一份 reviewTimeoutMs,活任务可跑到 ~2×;TTL 取 2×reviewTimeoutMs+60s,
+  // 否则另一个 session 的 idle 会在注入进行中把活任务误杀 failed ⇒ 同哈希二次冷审。
+  const ttl = Math.max((reviewTimeoutMs || 120000) * 2, 120000) + 60000;
   let swept = 0;
   for (const t of tasksMap.values()) {
     if (t.status !== "reviewing") continue;
@@ -289,10 +292,11 @@ export default async function AdvReview({ client }) {
         if (injectedParentID === "inject-pending" && lastUser) {
           // 【Bugbot(PR#2 Medium)】注入超时/失败不再 abort 用户会话 ⇒ 服务端仍可能
           // 把注入轮跑完;其迟到 idle 若被当新结论=审"审阅的回复"=justInjected 本要
-          // 防的循环。哨兵落位:最后一条 user 是我们的 synthetic 注入 → 采纳其 id 为
-          // 正式标记,按续写回合处理;不是(用户已发新消息)→ 清哨兵正常审新结论。
-          const isOurInject = (lastUser.parts || []).some((p) => p.synthetic)
-            || (lastUser.parts || []).some((p) => p.type === "text" && (p.text || "").startsWith("【对抗性审阅】"));
+          // 防的循环。哨兵落位:最后一条 user 文本以【对抗性审阅】开头(本插件专属
+          // 签名)才采纳其 id 为正式标记;Bugbot 二轮:synthetic 旗标过宽——压缩/工具
+          // 附件/子任务消息也是 synthetic,会错收真结论,只认文本前缀。
+          const isOurInject = (lastUser.parts || []).some(
+            (p) => p.type === "text" && (p.text || "").startsWith("【对抗性审阅】"));
           if (isOurInject) {
             justInjected.set(sid, lastUser.info.id);
             return;
@@ -456,9 +460,12 @@ export default async function AdvReview({ client }) {
       // 【Bugbot(PR#2 High)】顺序改动:先删 session(此间仍持 inFlight,不留无守卫窗口),
       // 后清 inFlight,recheck 在清守卫之后调度——再叠加 reviewLatest 入口重入守卫双保险。
       if (reviewSessionID) {
+        // Bugbot(PR#2 Medium): 定时器胜出后仍挂起的 delete 若裸交 race,迟到拒绝
+        // 无我方 handler——先自挂 catch 吞掉,再 race(竞速只管"完成没完成")。
+        const del = client.session.delete({ path: { id: reviewSessionID } }).catch(() => {});
         try {
           await Promise.race([
-            client.session.delete({ path: { id: reviewSessionID } }),
+            del,
             new Promise((r) => setTimeout(r, 10000)), // 删除挂起不无限期占住 inFlight
           ]);
         } catch { /* ignore */ }
