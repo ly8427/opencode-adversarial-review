@@ -7,6 +7,15 @@
 // 冷审阅全程用 opencode 原生 session.create + session.prompt,不 spawn 任何
 // 外部 CLI。部署只需把本文件放到 ~/.config/opencode/plugins/ (无 root)。
 //
+// DEBT #1 三处移植(修法已在 src/core.mjs 原生实现,本文件为插件侧等价实现):
+//   ① 注入失败/超时不再 session.abort 用户原会话(本插件从不拥有用户会话的生死,
+//      失败只丢自己的结果——src/core.mjs 缺陷③同款)
+//   ② 审阅结果绑定回答内容哈希(sha256 全文):注入文本带"审阅对象版本"头,
+//      同哈希冷却去重——src/core.mjs 缺陷②同款(answerHash/reviewedByHash)
+//   ③ 独立任务 ID + 审阅窗口内新结论的漏审治理:任务状态机
+//      reviewing→done|failed|skipped,审阅窗口内用户前进时标记 stale 并
+//      自动重触发"审最新"——src/core.mjs 缺陷④任务模型 + stale healing 同款
+//
 // 核对依据:2026-08 opencode dev 分支生成类型 + 源码(经四轮 review 核实)。
 // 服务器上以 node_modules/@opencode-ai/sdk 实际安装版本的类型为准。
 //
@@ -21,6 +30,9 @@
 //   - app.log 必填 service+level+message
 //   - task 工具建的子 session 带 parentID;fork 的不带(仍会被审)
 // =============================================================================
+
+import { createHash } from "node:crypto";
+import fs from "node:fs";
 
 // ===== 配置(可按需改) =====
 const CONFIG = {
@@ -46,6 +58,13 @@ const CONFIG = {
 
   // 审阅 prompt 超时(毫秒)。超时则 abort 审阅 session 并清理,避免 inFlight 永久残留。
   reviewTimeoutMs: 5 * 60 * 1000,
+
+  // 【DEBT #1② 移植】同一回答内容(sha256 相同)审阅完成后的冷却期;
+  // 期内同内容不重审,内容一变立即视为新版本。
+  cooldownMs: 30 * 60 * 1000,
+
+  // 【DEBT #1② 移植】审阅/注入失败后的重试冷却(防止每个 idle 事件都重烧一次失败审阅)。
+  failureCooldownMs: 5 * 60 * 1000,
 
   // 【per-session / per-turn 控制】标题或当前轮用户提词命中此正则 → 跳过本次审阅。
   //   会话级:给 session 标题加标记(如 "[debug] 排障")→ 该会话全程不审
@@ -79,6 +98,80 @@ const REVIEW_RE = CONFIG.reviewPattern ? new RegExp(CONFIG.reviewPattern, "i") :
 const selfCreated = new Set();
 const inFlight = new Set();
 const justInjected = new Map();
+// 【DEBT #1② 移植】版本绑定记录:hash -> { at: iso, ok: bool }。done/failed 落记录,
+// skipped 不落(新答案仍是全新审阅对象)。
+const reviewedByHash = new Map();
+// 【DEBT #1③ 移植】任务模型:独立 ID + 状态机 reviewing→done|failed|skipped;内存态,上限 200 条。
+const tasks = new Map();
+
+// =============================================================================
+// 移植 helper(模块级,导出仅供测试;src/core.mjs 同款语义的插件侧内存版)
+// =============================================================================
+export function answerHashOf(text) {
+  return createHash("sha256").update(String(text == null ? "" : text).trim(), "utf8").digest("hex");
+}
+export const hash8 = (h) => (h || "").slice(0, 8);
+
+export function createTask(tasksMap, { sessionId, answerHash: hash, turn = null }) {
+  const id = `adv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  // 每会话只保留最新一个活跃任务:同会话旧的 reviewing 一律标记 skipped(superseded)
+  for (const t of tasksMap.values()) {
+    if (sessionId && t.sessionId === sessionId && t.status === "reviewing") {
+      t.status = "skipped";
+      t.skippedReason = "superseded-by-latest";
+      t.finishedAt = new Date().toISOString();
+    }
+  }
+  const task = {
+    id, sessionId, turn, answerHash: hash,
+    status: "reviewing", startedAt: new Date().toISOString(), finishedAt: null, error: null,
+  };
+  tasksMap.set(id, task);
+  // 内存态上限(TUI 长进程):超 200 条时从最旧开始清已完结任务,reviewing 永不清
+  if (tasksMap.size > 200) {
+    for (const [k, t] of tasksMap) {
+      if (tasksMap.size <= 200) break;
+      if (t.status !== "reviewing") tasksMap.delete(k);
+    }
+  }
+  return task;
+}
+
+export function finishTask(tasksMap, reviewedByHashMap, id, { status, error = null }) {
+  const t = tasksMap.get(id);
+  if (!t) return null;
+  t.status = status;
+  t.finishedAt = new Date().toISOString();
+  t.error = error;
+  // 与 src/core.mjs finishTask 同款:done/failed 落版本绑定记录;skipped 不落
+  if (status === "done") reviewedByHashMap.set(t.answerHash, { at: t.finishedAt, ok: true });
+  else if (status === "failed") reviewedByHashMap.set(t.answerHash, { at: t.finishedAt, ok: false });
+  return t;
+}
+
+// 去重/冷却(src/core.mjs shouldReview 同款):同哈希在审→跳;同哈希冷却期内 done→跳;
+// failed→短冷却跳;过期/损坏记录就地删除(内存有界)。返回 {review, reason?}。
+export function decideReview(tasksMap, reviewedByHashMap, hash, { cooldownMs, failureCooldownMs }, now = Date.now()) {
+  for (const t of tasksMap.values()) {
+    if (t.status === "reviewing" && t.answerHash === hash) {
+      return { review: false, reason: "same answer in-flight" };
+    }
+  }
+  const rec = reviewedByHashMap.get(hash);
+  if (rec) {
+    const at = Date.parse(rec.at);
+    if (!Number.isFinite(at)) {
+      reviewedByHashMap.delete(hash); // 损坏记录清掉
+    } else {
+      const cooldown = rec.ok ? cooldownMs : failureCooldownMs;
+      if (now - at < cooldown) {
+        return { review: false, reason: rec.ok ? "cooldown (same answer recently reviewed)" : "failure cooldown" };
+      }
+      reviewedByHashMap.delete(hash); // 过期即删
+    }
+  }
+  return { review: true };
+}
 
 // =============================================================================
 // plugin 主体
@@ -94,7 +187,8 @@ export default async function AdvReview({ client }) {
       .app.log({ body: { service: "adv-review", level: "info", message: line } })
       .catch(() => {});
     if (process.env.ADV_DEBUG_FILE) {
-      try { require("fs").appendFileSync(process.env.ADV_DEBUG_FILE, line + "\n"); } catch {}
+      // ESM 下 require 不存在(旧写法静默失效,被 catch 吞掉)——改用顶部 import 的 fs
+      try { fs.appendFileSync(process.env.ADV_DEBUG_FILE, line + "\n"); } catch {}
     }
   };
 
@@ -151,6 +245,195 @@ export default async function AdvReview({ client }) {
     }
   };
 
+  // ===== 单轮审阅流程(事件体抽成可重入函数:DEBT #1③ 漏审治理需要"审完再审最新") =====
+  const reviewLatest = async (sid) => {
+    // 【关键】inFlight 必须在任何 await 之前置位,堵住并发双触发的 TOCTOU 窗口
+    inFlight.add(sid);
+    let reviewSessionID; // 提升到外层,finally 才能在所有路径(含超时/失败 return)统一清理
+    let recheckLatest = false; // 【DEBT #1③】审阅窗口内用户已前进 → finally 重触发"审最新"
+    try {
+      // ② 防循环:刚注入审阅 → 比对 parentID,判断本轮 idle 是不是"审阅续写"
+      if (justInjected.has(sid)) {
+        const injectedParentID = justInjected.get(sid);
+        // 拉最后一条 user 消息,比对 id
+        const msgsResp0 = await client.session.messages({ path: { id: sid } });
+        const msgs0 = msgsResp0.data || [];
+        const lastUser = [...msgs0].reverse().find((m) => m.info.role === "user");
+        if (lastUser && lastUser.info.id === injectedParentID) {
+          // 这就是审阅触发的续写回合 → 跳过,但保留标记(下次新结论时再清)
+          return;
+        }
+        // 不是续写(用户发了新消息)→ 清标记,正常往下审
+        justInjected.delete(sid);
+      }
+
+      // 只审主 session:子 agent session(有 parentID)跳过;fork 的不带 parentID 仍被审
+      const sessResp = await client.session.get({ path: { id: sid } });
+      const session = sessResp.data;
+      if (!session) return;
+      if (session.parentID) {
+        log("skip child session:", sid, "parent=", session.parentID);
+        return;
+      }
+
+      // 会话级跳过:标题命中标记 → 该 session 全程不审
+      if (session.title && SKIP_RE.test(session.title)) {
+        log("skip by title marker:", sid, session.title);
+        return;
+      }
+
+      // 拉消息,取最后一条 assistant 文本(数组升序,末尾是最新)
+      const msgsResp = await client.session.messages({ path: { id: sid } });
+      const msgs = msgsResp.data || [];
+      const lastAssistant = [...msgs].reverse().find((m) => m.info.role === "assistant");
+      const text = extractAssistantText(lastAssistant);
+      if (!text) return;
+
+      // 单轮级跳过:当前轮用户提词命中标记 → 仅这一轮不审
+      //   (排除 synthetic:我们注入的审阅不算用户提词)
+      const lastUserEntry = [...msgs].reverse().find((m) => m.info.role === "user");
+      const lastUserText = lastUserEntry
+        ? lastUserEntry.parts.filter((p) => p.type === "text" && !p.synthetic && !p.ignored).map((p) => p.text).join("\n").trim()
+        : "";
+      if (lastUserText && SKIP_RE.test(lastUserText)) {
+        log("skip by prompt marker:", sid);
+        return;
+      }
+
+      // opt-in 白名单:设了 reviewPattern 时,标题或当前轮提词命中才审;
+      // 都不命中 → 跳过(默认从"全审"切到"白名单内审")。skip 优先级已在上面处理。
+      if (REVIEW_RE && !REVIEW_RE.test(session.title || "") && !REVIEW_RE.test(lastUserText)) {
+        log("skip: not in review whitelist", sid);
+        return;
+      }
+
+      // 记下触发本次审阅的 user 消息 id:注入前要比对它,若用户在冷审阅窗口内发了新消息
+      // (最后一条 user 变了)→ 放弃注入,避免"针对旧结论 C 的审阅错位打到新消息 M 上下文"。
+      const triggerUserID = lastUserEntry ? lastUserEntry.info.id : null;
+
+      // Layer 1 本地过滤(零成本)
+      const fr = localFilter(text);
+      if (!fr.pass) {
+        log("skip L1:", sid, fr.reason);
+        return;
+      }
+
+      // 注入前查 status:端点 path 为 never,返回全量 map,按 sid 取
+      const stResp = await client.session.status();
+      if (stResp.data?.[sid]?.type === "busy") {
+        log("skip busy:", sid);
+        return;
+      }
+
+      // 【DEBT #1②】版本绑定门:同哈希在审/冷却期内 → 跳(内容一变立即视为新版本)
+      const aHash = answerHashOf(text);
+      const gate = decideReview(tasks, reviewedByHash, aHash, CONFIG);
+      if (!gate.review) {
+        log("skip hash gate:", sid, hash8(aHash), gate.reason);
+        return;
+      }
+
+      // 【DEBT #1③】独立任务 ID:reviewing 起状态;同会话旧活跃任务被标记 superseded
+      const task = createTask(tasks, { sessionId: sid, answerHash: aHash, turn: triggerUserID });
+      log("task created:", task.id, "session", sid, "answer", hash8(aHash));
+
+      // ===== 冷审阅:建新 session(无历史=冷) =====
+      const created = await client.session.create({
+        body: { title: "adv-review-cold" },
+        ...(CONFIG.reviewDirectory ? { query: { directory: CONFIG.reviewDirectory } } : {}),
+      });
+      reviewSessionID = created.data?.id;
+      if (!reviewSessionID) throw new Error("session.create returned no id");
+      selfCreated.add(reviewSessionID);
+      log("cold session created:", reviewSessionID, "for", sid);
+
+      // 同步 prompt:system 放审阅者人设(追加在 AGENTS.md 后),parts 放被审结论;
+      // tools:{"*":false} 禁用所有工具,让审阅一步完成、不读不改文件
+      let reviewResp;
+      try {
+        reviewResp = await promptWithTimeout(reviewSessionID, {
+          system: CONFIG.reviewSystemPrompt,
+          parts: [{ type: "text", text: text }],
+          tools: { "*": false },
+          ...(CONFIG.reviewModel ? { model: CONFIG.reviewModel } : {}),
+        });
+      } catch (e) {
+        // 审阅超时/失败:fire-and-forget abort 服务端轮(不 await —
+        // await 在挂起时不返回 → finally 延迟 → inFlight 锁死。controller.abort 已取消客户端 fetch)。
+        // 只 abort 自己建的审阅 session;任务落 failed(失败冷却挡住连续重烧)。
+        log("review failed/timeout:", e?.message || String(e));
+        client.session.abort({ path: { id: reviewSessionID } }).catch(() => {});
+        finishTask(tasks, reviewedByHash, task.id, { status: "failed", error: String(e?.message || e) });
+        return;
+      }
+
+      const reviewText = (reviewResp.data?.parts || [])
+        .filter((p) => p.type === "text" && !p.synthetic && !p.ignored)
+        .map((p) => p.text)
+        .join("\n")
+        .trim();
+
+      if (!reviewText) {
+        // 审阅完成但零输出 = "无实质发现"的合法结果(done;同内容进冷却,不重烧)
+        log("skip: empty review for", sid);
+        finishTask(tasks, reviewedByHash, task.id, { status: "done" });
+        return;
+      }
+
+      // ===== 注入回原 session =====
+      // 先治"错位":若冷审阅窗口内用户发了新消息(最后一条 user id ≠ triggerUserID),
+      // 放弃本次注入——避免针对旧结论 C 的审阅错位打到新消息 M 的上下文。
+      // 【DEBT #1③】旧实现到此为止,"M 的结论被 inFlight 防重入挡掉漏审"是已知边界;
+      // 现改为:任务落 skipped + recheckLatest → finally 重触发一次"审最新"。
+      {
+        const recheck = await client.session.messages({ path: { id: sid } });
+        const nowLastUser = [...(recheck.data || [])].reverse().find((m) => m.info.role === "user");
+        if (triggerUserID && nowLastUser && nowLastUser.info.id !== triggerUserID) {
+          log("skip inject: user moved on during review (stale conclusion)", sid);
+          finishTask(tasks, reviewedByHash, task.id, { status: "skipped", error: "stale-user-moved-on" });
+          recheckLatest = true;
+          return;
+        }
+      }
+
+      // 注入也是完整 LLM 轮(触发 assistant 续写),用 promptWithTimeout 封顶(现含真取消)。
+      // 【DEBT #1①】失败**不再 session.abort 用户原会话**——本插件不拥有用户会话的生死,
+      // 失败只丢自己的结果(任务落 failed;失败冷却后同内容可重审)。
+      let injectResp;
+      try {
+        injectResp = await promptWithTimeout(sid, {
+          parts: [{ type: "text", text: `【对抗性审阅】(审阅对象版本: ${hash8(aHash)})\n` + reviewText, synthetic: true }],
+        });
+      } catch (e) {
+        log("inject failed/timeout (no session.abort per DEBT#1①):", sid, e?.message || String(e));
+        finishTask(tasks, reviewedByHash, task.id, { status: "failed", error: String(e?.message || e) });
+        return;
+      }
+      const triggerParentID = injectResp.data?.info?.parentID;
+      if (triggerParentID) justInjected.set(sid, triggerParentID);
+      finishTask(tasks, reviewedByHash, task.id, { status: "done" });
+      log("review injected into", sid, `(task=${task.id}, answer=${hash8(aHash)}, ${reviewText.length} chars, parentID=${triggerParentID})`);
+
+    } finally {
+      // 无论成败(含超时/失败 return 路径):清 in-flight;删除审阅 session 并从 Set 移除
+      inFlight.delete(sid);
+      if (reviewSessionID) {
+        try { await client.session.delete({ path: { id: reviewSessionID } }); } catch { /* ignore */ }
+        selfCreated.delete(reviewSessionID);
+      }
+      // 【DEBT #1③】漏审治理:审阅窗口内用户前进 → 重触发一次"审最新"
+      // (重触发经全部守卫:届时若 busy,其完成时的 idle 事件走正常路径;
+      //  每次重审的都是最新内容,有限收敛,无死循环面)
+      if (recheckLatest) {
+        setTimeout(() => {
+          reviewLatest(sid).catch((e) => {
+            try { log("recheck reviewLatest failed:", sid, e?.message || String(e)); } catch {}
+          });
+        }, 50);
+      }
+    }
+  };
+
   return {
     event: async ({ event }) => {
       // ⚠ fire-and-forget:handler 抛错 = unhandled rejection(框架不吞),必须全局兜底
@@ -181,160 +464,9 @@ export default async function AdvReview({ client }) {
         // ① 自建审阅 session 跳过
         if (selfCreated.has(sid)) return;
         // ③ 防重入:正在审阅的 session 跳过
+        //   (无需在此记"待审":在途审阅若发现用户已前进,其 finally 会重触发审最新——DEBT #1③)
         if (inFlight.has(sid)) return;
-        // 【关键】inFlight 必须在任何 await 之前置位,堵住并发双触发的 TOCTOU 窗口
-        inFlight.add(sid);
-        let reviewSessionID; // 提升到外层,finally 才能在所有路径(含超时/失败 return)统一清理
-        try {
-          // ② 防循环:刚注入审阅 → 比对 parentID,判断本轮 idle 是不是"审阅续写"
-          if (justInjected.has(sid)) {
-            const injectedParentID = justInjected.get(sid);
-            // 拉最后一条 user 消息,比对 id
-            const msgsResp0 = await client.session.messages({ path: { id: sid } });
-            const msgs0 = msgsResp0.data || [];
-            const lastUser = [...msgs0].reverse().find((m) => m.info.role === "user");
-            if (lastUser && lastUser.info.id === injectedParentID) {
-              // 这就是审阅触发的续写回合 → 跳过,但保留标记(下次新结论时再清)
-              return;
-            }
-            // 不是续写(用户发了新消息)→ 清标记,正常往下审
-            justInjected.delete(sid);
-          }
-
-          // 只审主 session:子 agent session(有 parentID)跳过;fork 的不带 parentID 仍被审
-          const sessResp = await client.session.get({ path: { id: sid } });
-          const session = sessResp.data;
-          if (!session) return;
-          if (session.parentID) {
-            log("skip child session:", sid, "parent=", session.parentID);
-            return;
-          }
-
-          // 会话级跳过:标题命中标记 → 该 session 全程不审
-          if (session.title && SKIP_RE.test(session.title)) {
-            log("skip by title marker:", sid, session.title);
-            return;
-          }
-
-          // 拉消息,取最后一条 assistant 文本(数组升序,末尾是最新)
-          const msgsResp = await client.session.messages({ path: { id: sid } });
-          const msgs = msgsResp.data || [];
-          const lastAssistant = [...msgs].reverse().find((m) => m.info.role === "assistant");
-          const text = extractAssistantText(lastAssistant);
-          if (!text) return;
-
-          // 单轮级跳过:当前轮用户提词命中标记 → 仅这一轮不审
-          //   (排除 synthetic:我们注入的审阅不算用户提词)
-          const lastUserEntry = [...msgs].reverse().find((m) => m.info.role === "user");
-          const lastUserText = lastUserEntry
-            ? lastUserEntry.parts.filter((p) => p.type === "text" && !p.synthetic && !p.ignored).map((p) => p.text).join("\n").trim()
-            : "";
-          if (lastUserText && SKIP_RE.test(lastUserText)) {
-            log("skip by prompt marker:", sid);
-            return;
-          }
-
-          // opt-in 白名单:设了 reviewPattern 时,标题或当前轮提词命中才审;
-          // 都不命中 → 跳过(默认从"全审"切到"白名单内审")。skip 优先级已在上面处理。
-          if (REVIEW_RE && !REVIEW_RE.test(session.title || "") && !REVIEW_RE.test(lastUserText)) {
-            log("skip: not in review whitelist", sid);
-            return;
-          }
-
-          // 记下触发本次审阅的 user 消息 id:注入前要比对它,若用户在冷审阅窗口内发了新消息
-          // (最后一条 user 变了)→ 放弃注入,避免"针对旧结论 C 的审阅错位打到新消息 M 上下文"。
-          const triggerUserID = lastUserEntry ? lastUserEntry.info.id : null;
-
-          // Layer 1 本地过滤(零成本)
-          const fr = localFilter(text);
-          if (!fr.pass) {
-            log("skip L1:", sid, fr.reason);
-            return;
-          }
-
-          // 注入前查 status:端点 path 为 never,返回全量 map,按 sid 取
-          const stResp = await client.session.status();
-          if (stResp.data?.[sid]?.type === "busy") {
-            log("skip busy:", sid);
-            return;
-          }
-
-          // ===== 冷审阅:建新 session(无历史=冷) =====
-          const created = await client.session.create({
-            body: { title: "adv-review-cold" },
-            ...(CONFIG.reviewDirectory ? { query: { directory: CONFIG.reviewDirectory } } : {}),
-          });
-          reviewSessionID = created.data?.id;
-          if (!reviewSessionID) throw new Error("session.create returned no id");
-          selfCreated.add(reviewSessionID);
-          log("cold session created:", reviewSessionID, "for", sid);
-
-          // 同步 prompt:system 放审阅者人设(追加在 AGENTS.md 后),parts 放被审结论;
-          // tools:{"*":false} 禁用所有工具,让审阅一步完成、不读不改文件
-          let reviewResp;
-          try {
-            reviewResp = await promptWithTimeout(reviewSessionID, {
-              system: CONFIG.reviewSystemPrompt,
-              parts: [{ type: "text", text: text }],
-              tools: { "*": false },
-              ...(CONFIG.reviewModel ? { model: CONFIG.reviewModel } : {}),
-            });
-          } catch (e) {
-            // 审阅超时/失败:fire-and-forget abort 服务端轮(不 await —
-            // await 在挂起时不返回 → finally 延迟 → inFlight 锁死。controller.abort 已取消客户端 fetch)
-            log("review failed/timeout:", e?.message || String(e));
-            client.session.abort({ path: { id: reviewSessionID } }).catch(() => {});
-            return;
-          }
-
-          const reviewText = (reviewResp.data?.parts || [])
-            .filter((p) => p.type === "text" && !p.synthetic && !p.ignored)
-            .map((p) => p.text)
-            .join("\n")
-            .trim();
-
-          if (!reviewText) {
-            log("skip: empty review for", sid);
-            return;
-          }
-
-          // ===== 注入回原 session =====
-          // 先治"错位":若冷审阅窗口内用户发了新消息(最后一条 user id ≠ triggerUserID),
-          // 放弃本次注入——避免针对旧结论 C 的审阅错位打到新消息 M 的上下文。
-          // (注意:这只治错位,救不回"M 的结论被 inFlight 防重入挡掉漏审"——那是已知边界。)
-          {
-            const recheck = await client.session.messages({ path: { id: sid } });
-            const nowLastUser = [...(recheck.data || [])].reverse().find((m) => m.info.role === "user");
-            if (triggerUserID && nowLastUser && nowLastUser.info.id !== triggerUserID) {
-              log("skip inject: user moved on during review (stale conclusion)", sid);
-              return;
-            }
-          }
-
-          // 注入也是完整 LLM 轮(触发 assistant 续写),用 promptWithTimeout 封顶(现含真取消)。
-          // 失败则 fire-and-forget abort sid(不 await,同审阅超时,避免挂起卡 finally)。
-          let injectResp;
-          try {
-            injectResp = await promptWithTimeout(sid, {
-              parts: [{ type: "text", text: "【对抗性审阅】\n" + reviewText, synthetic: true }],
-            });
-          } catch (e) {
-            log("inject failed/timeout, fire-and-forget abort sid:", sid, e?.message || String(e));
-            client.session.abort({ path: { id: sid } }).catch(() => {});
-            return;
-          }
-          const triggerParentID = injectResp.data?.info?.parentID;
-          if (triggerParentID) justInjected.set(sid, triggerParentID);
-          log("review injected into", sid, `(${reviewText.length} chars, parentID=${triggerParentID})`);
-
-        } finally {
-          // 无论成败(含超时/失败 return 路径):清 in-flight;删除审阅 session 并从 Set 移除
-          inFlight.delete(sid);
-          if (reviewSessionID) {
-            try { await client.session.delete({ path: { id: reviewSessionID } }); } catch { /* ignore */ }
-            selfCreated.delete(reviewSessionID);
-          }
-        }
+        await reviewLatest(sid);
       } catch (err) {
         // fire-and-forget 兜底:任何异常都吃掉记日志,绝不抛成 unhandled rejection
         try {
