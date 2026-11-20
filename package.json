@@ -1,0 +1,6 @@
+{
+  "name": "opencode-adversarial-review",
+  "private": true,
+  "type": "module",
+  "description": "Cold-agent adversarial review plugins (OpenCode single-file + Claude Code adapter). type:module makes .js ESM under any Node — adversarial-review.js is pure ESM syntax and Node <22 would otherwise parse it as CommonJS and die on import (board #123 opencode #2738 finding)."
+}
