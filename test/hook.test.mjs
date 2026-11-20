@@ -284,3 +284,48 @@ test("非 Stop 事件 / 空 stdin / 坏 JSON：一律放行", async () => {
   const r3 = await runHook("", env);
   assert.equal(r3.stdout.trim(), "");
 });
+
+// 预置一个 reviewing 任务写进 state.json（模拟钩子进程死于审阅中途）
+function seedReviewingTask(stateDir, hash, ageMs) {
+  fs.mkdirSync(stateDir, { recursive: true });
+  const state = {
+    tasks: {
+      "adv-stale": {
+        id: "adv-stale", sessionId: "sess-1", turn: null, answerHash: hash,
+        trigger: "hook", status: "reviewing",
+        startedAt: new Date(Date.now() - ageMs).toISOString(),
+        finishedAt: null, error: null, findingsCount: null,
+      },
+    },
+    reviewedByHash: {},
+  };
+  fs.writeFileSync(path.join(stateDir, "state.json"), JSON.stringify(state));
+}
+
+test("卡死自愈（Bugbot #34b4c951）: 陈旧 reviewing 任务被清理并放行重审", async () => {
+  const dir = mktmp();
+  const cfgFile = writeConfig(dir, {});
+  const stateDir = mktmp();
+  const touch = path.join(dir, "touch.txt");
+  const transcript = transcriptFixture(dir);
+  seedReviewingTask(stateDir, answerHash(ANSWER), 10 * 60 * 1000); // 10 分钟前 = 远超 TTL
+  const r = await runHook(stdInput({ transcriptPath: transcript }), baseEnv({ config: cfgFile, stateDir, reviewerCase: "findings", touchFile: touch }));
+  assert.equal(JSON.parse(r.stdout.trim().split("\n").filter((l) => l.trim())[0]).decision, "block", "陈旧任务不得堵死重审");
+  const state = loadState(stateDir);
+  assert.equal(state.tasks["adv-stale"].status, "failed");
+  assert.match(state.tasks["adv-stale"].error, /stale/);
+  assert.ok(Object.values(state.tasks).some((t) => t.status === "done"), "新审阅任务应正常完成");
+});
+
+test("在途保护: 新鲜的 reviewing 任务仍跳过（不误杀并发会话的正常在审）", async () => {
+  const dir = mktmp();
+  const cfgFile = writeConfig(dir, {});
+  const stateDir = mktmp();
+  const touch = path.join(dir, "touch.txt");
+  const transcript = transcriptFixture(dir);
+  seedReviewingTask(stateDir, answerHash(ANSWER), 5 * 1000); // 5 秒前 = TTL 内
+  const r = await runHook(stdInput({ transcriptPath: transcript }), baseEnv({ config: cfgFile, stateDir, reviewerCase: "findings", touchFile: touch }));
+  assert.equal(r.stdout.trim(), "", "TTL 内的在途任务应跳过");
+  assert.ok(!fs.existsSync(touch), "不应触发第二次审阅");
+  assert.equal(loadState(stateDir).tasks["adv-stale"].status, "reviewing", "新鲜任务不应被误标记");
+});

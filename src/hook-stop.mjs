@@ -24,6 +24,7 @@ import {
   createTask, finishTask, shouldReview, appendHistory,
   normalizeFindings, formatFindings,
   lastUserQuestionFromTranscript, lastAssistantFromTranscript,
+  sweepStaleReviewing, HOOK_TIMEOUT_BUDGET_MS,
 } from "./core.mjs";
 import { buildReviewPrompt, runReviewer, parseReviewerOutput } from "./reviewer.mjs";
 
@@ -34,6 +35,23 @@ const debug = (msg) => {
     try { fs.appendFileSync(process.env.ADV_DEBUG_FILE, line + "\n"); } catch { /* ignore */ }
   }
 };
+
+// 信号兜底（best-effort）：审阅中途被 SIGINT/SIGTERM 打断时，把任务标记为 failed 再退，
+// 不给 state 留卡死的 reviewing。SIGKILL 无法拦截——那种残余由下次启动的陈旧清扫兜住。
+let currentTask = null;
+let currentDir = null;
+let currentState = null;
+function markInterruptedThenExit() {
+  if (currentTask && currentState && currentDir) {
+    try {
+      finishTask(currentState, currentTask.id, { status: "failed", error: "hook interrupted (signal)" });
+      saveStateAtomic(currentDir, currentState);
+    } catch { /* ignore */ }
+  }
+  process.exit(0);
+}
+process.on("SIGINT", markInterruptedThenExit);
+process.on("SIGTERM", markInterruptedThenExit);
 
 // stdout 写完再退（process.exit 会截断未刷出的缓冲，Windows 上尤其明显）
 function writeStdoutThenExit(data, code = 0) {
@@ -120,7 +138,12 @@ async function main() {
   const hash = answerHash(answer);
   const dir = stateDirFor(cwd, process.env);
   const state = loadState(dir);
-  const sr = shouldReview(state, { answerHash: hash, sessionId: input.session_id || null }, config);
+  // 钩子预算内的有效超时：reviewTimeoutMs 配得再大，也截到 HOOK_TIMEOUT_BUDGET_MS
+  // （hooks.json 给钩子 180 秒；超出预算 = 宿主先杀钩子、内部超时永远不触发、任务卡 reviewing）
+  const effCfg = { ...config, reviewTimeoutMs: Math.min(config.reviewTimeoutMs, HOOK_TIMEOUT_BUDGET_MS) };
+  // 启动清扫：上次进程死于审阅中途留下的 reviewing 陈尸，标记 failed 并立即落盘（放行重审）
+  if (sweepStaleReviewing(state, effCfg) > 0) saveStateAtomic(dir, state);
+  const sr = shouldReview(state, { answerHash: hash, sessionId: input.session_id || null }, effCfg);
   if (!sr.review) {
     debug(`skip dedupe (${hash8(hash)}): ${sr.reason}`);
     return process.exit(0);
@@ -133,17 +156,19 @@ async function main() {
     trigger: "hook",
   });
   saveStateAtomic(dir, state);
+  currentTask = task; currentDir = dir; currentState = state; // 信号兜底用（见底部 handler）
 
   // ===== 冷审阅（同步，回合冻结在此）=====
   let review;
   try {
     const evidence = config.includeGitEvidence ? gitEvidence(cwd) : null;
     const prompt = buildReviewPrompt({ answer, userQuestion, focus: null, evidence });
-    const run = await runReviewer({ prompt, config, env: process.env });
+    const run = await runReviewer({ prompt, config: effCfg, env: process.env });
     review = parseReviewerOutput(run, normalizeFindings);
   } catch (e) {
     review = { ok: false, verdict: "parse_error", findings: [], error: String(e?.message || e), durationMs: null };
   }
+  currentTask = null;
 
   const status = review.ok ? "done" : "failed";
   finishTask(state, task.id, {

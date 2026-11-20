@@ -12,6 +12,7 @@ import {
   stateDirFor, loadState, saveStateAtomic, createTask, finishTask, shouldReview,
   appendHistory, readHistory, formatFindings,
   lastUserQuestionFromTranscript, lastAssistantFromTranscript,
+  sweepStaleReviewing, staleReviewTtlMs, HOOK_TIMEOUT_BUDGET_MS,
 } from "../src/core.mjs";
 
 const mktmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "adv-core-"));
@@ -236,6 +237,45 @@ test("状态机: 每会话只保留最新活跃任务，旧的被 superseded", (
   assert.equal(state.tasks[t1.id].status, "skipped");
   assert.equal(state.tasks[t1.id].skippedReason, "superseded-by-latest");
   assert.equal(t2.status, "reviewing");
+});
+
+test("卡死自愈（Bugbot #34b4c951）: 陈旧 reviewing 任务被标记 failed 并放行重审", () => {
+  const { state } = freshSetup();
+  const cfg = { cooldownMs: 30 * 60 * 1000, failureCooldownMs: 300000, reviewTimeoutMs: 120000 };
+  const hash = answerHash("结论 Z");
+  const t = createTask(state, { sessionId: "s1", answerHash: hash });
+  // 模拟进程死于审阅中途：startedAt 回拨到 TTL 之外
+  state.tasks[t.id].startedAt = new Date(Date.now() - staleReviewTtlMs(cfg) - 1000).toISOString();
+  const sr = shouldReview(state, { answerHash: hash, sessionId: "s1" }, cfg);
+  assert.equal(sr.review, true, "陈旧 reviewing 不应堵死重审");
+  assert.equal(state.tasks[t.id].status, "failed");
+  assert.match(state.tasks[t.id].error, /stale/);
+});
+
+test("在途保护: 新鲜的 reviewing 任务仍视为在途（不误杀正常在审任务）", () => {
+  const { state } = freshSetup();
+  const cfg = { cooldownMs: 30 * 60 * 1000, failureCooldownMs: 300000, reviewTimeoutMs: 120000 };
+  const t = createTask(state, { sessionId: "s1", answerHash: answerHash("新鲜") });
+  const sr = shouldReview(state, { answerHash: t.answerHash, sessionId: "s1" }, cfg);
+  assert.equal(sr.review, false);
+  assert.equal(state.tasks[t.id].status, "reviewing");
+});
+
+test("清扫幂等: sweepStaleReviewing 只动陈旧任务，可重复调用", () => {
+  const { state } = freshSetup();
+  const cfg = { reviewTimeoutMs: 120000 };
+  const old1 = createTask(state, { sessionId: "a", answerHash: answerHash("旧1") });
+  const fresh = createTask(state, { sessionId: "b", answerHash: answerHash("新") });
+  state.tasks[old1.id].startedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  assert.equal(sweepStaleReviewing(state, cfg), 1);
+  assert.equal(state.tasks[old1.id].status, "failed");
+  assert.equal(fresh.status, "reviewing");
+  assert.equal(sweepStaleReviewing(state, cfg), 0, "第二次清扫应无目标");
+});
+
+test("钩子预算常量存在且低于 hooks.json 的 180 秒（Bugbot #fb14c942）", () => {
+  assert.equal(HOOK_TIMEOUT_BUDGET_MS, 170000);
+  assert.ok(HOOK_TIMEOUT_BUDGET_MS < 180000);
 });
 
 test("状态存储: 原子写落盘且无临时文件残留；损坏恢复隔离坏文件", () => {

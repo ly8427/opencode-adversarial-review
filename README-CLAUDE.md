@@ -78,7 +78,9 @@ claude --plugin-dir /path/to/opencode-adversarial-review
   "reviewerCommand": "claude",   // 审阅命令
   "reviewerArgs": [],            // 追加参数（不能覆盖固定安全参数）
   "reviewModel": null,           // 审阅模型，如 "opus"；缺省=跟随 claude 默认
-  "reviewTimeoutMs": 120000,     // 审阅硬超时；到点杀审阅进程、放行主会话
+  "reviewTimeoutMs": 120000,     // 审阅硬超时；到点杀审阅进程、放行主会话。
+                                 // 自动钩子路径实际上限 170 秒（低于钩子 180 秒预算，超出自动截断）；
+                                 // CLI 路径（手动命令）不受此限
   "cooldownMs": 1800000,         // 同一回答内容的免审冷却（默认 30 分钟）
   "skipPattern": "\\[(skip|noreview|debug)\\]",   // 用户提词命中 → 该轮不审
   "reviewPattern": null,         // 设了则只审命中该正则的轮次（opt-in 白名单）

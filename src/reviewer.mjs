@@ -58,13 +58,32 @@ export function buildReviewPrompt({ answer, userQuestion = null, focus = null, e
   return sections.join("\n\n---\n\n");
 }
 
+// ===== 配置值进 shell 命令行前的白名单净化（Bugbot #ccf429d8）=====
+// 威胁模型：克隆来的仓库自带 .adversarial-review.json，其 reviewerCommand /
+// reviewModel / reviewerArgs 会被拼进 shell:true 命令行；双引号包裹挡不住
+// $( )、反引号、%VAR% 等展开 → 项目配置可以借审阅启动执行任意命令。
+// 因此配置值一律过白名单字符校验，不合格直接拒用（stderr 警告 + 跳过该项）。
+// 固定安全参数是代码常量，不经此净化；ADV_REVIEWER_CMD 环境变量是文档化逃生门
+// （进程所有者即配置所有者，无越权面），整体替换、不净化。
+// 允许集：字母数字、空格/制表符、- _ . = : @ / \ + ,（覆盖 Windows 路径与模型名）。
+const SAFE_VALUE_RE = /^[A-Za-z0-9_\-\.=:@\/\\ +,\t]+$/;
+
+function sanitizeValue(value, label) {
+  const s = String(value);
+  if (s.trim() === "" || !SAFE_VALUE_RE.test(s)) {
+    process.stderr.write(`[adv-review] config value rejected for ${label} (unsafe shell characters): ${JSON.stringify(s.slice(0, 80))}\n`);
+    return null;
+  }
+  return s;
+}
+
 // ===== 固定安全参数（2026-11-20 实机核对，claude 2.1.97）=====
 // - `--tools ""`：把全部内置工具从模型上下文移除（实机验证：模型自答"无工具"，
 //   输入 token 4172 → 350）。这是真正的无工具形态。
 // - `--disallowedTools "*"`：双保险。实机核对它只拒绝调用、不移除上下文，
 //   但作为硬 deny 兜住任何 --tools 漏掉的残余（如某些版本对 bare 三件的策略差异）。
 // - 不单用 `--disallowedTools "*"`：2026-11-20 实测它保留了 bare 三件工具的上下文。
-// 这些参数不可被配置覆盖；reviewerArgs 只允许"追加"，不能替换或删除任何一项。
+// 这些参数不可被配置覆盖；reviewerArgs 只允许"追加"，不能替换或删除这里的任何一项。
 export function reviewerArgs(config) {
   const args = [
     "--bare",
@@ -74,8 +93,14 @@ export function reviewerArgs(config) {
     "--output-format", "json",
     "--max-turns", "3",
   ];
-  if (config.reviewModel) args.push("--model", String(config.reviewModel));
-  for (const a of config.reviewerArgs || []) args.push(String(a));
+  if (config.reviewModel) {
+    const model = sanitizeValue(config.reviewModel, "reviewModel");
+    if (model) args.push("--model", model);
+  }
+  for (const a of config.reviewerArgs || []) {
+    const v = sanitizeValue(a, "reviewerArgs");
+    if (v) args.push(v);
+  }
   return args;
 }
 
@@ -91,9 +116,8 @@ function quoteForShell(a) {
 export function buildCommandLine(config, env = {}) {
   const override = env.ADV_REVIEWER_CMD;
   if (override) return String(override);
-  return [String(config.reviewerCommand || "claude"), ...reviewerArgs(config)]
-    .map(quoteForShell)
-    .join(" ");
+  const cmd = sanitizeValue(config.reviewerCommand, "reviewerCommand") || "claude";
+  return [cmd, ...reviewerArgs(config)].map(quoteForShell).join(" ");
 }
 
 // 跨平台杀进程：Windows 上 shell:true 包了 cmd.exe，直接 child.kill 可能只杀壳不杀孙进程

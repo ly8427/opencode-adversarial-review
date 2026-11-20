@@ -228,6 +228,12 @@ export function normalizeFindings(rawText) {
   return { verdict, findings };
 }
 
+// ===== 钩子路径的审阅超时上限（Bugbot #fb14c942）=====
+// hooks.json 给钩子的预算是 180 秒；reviewTimeoutMs 配得比它大时，宿主会先杀钩子，
+// 内部超时永远不触发、任务卡 reviewing。钩子入口据此把实际审阅超时截到预算内
+// （留 10 秒给 stdin 读取/进程派生/状态写盘）；CLI 路径无宿主天花板，不受此限。
+export const HOOK_TIMEOUT_BUDGET_MS = 170000;
+
 // ===== 状态存储 =====
 // 状态目录：env.ADV_STATE_DIR（逃生门/测试）> ~/.adv-review/state/<项目路径哈希>
 export function stateDirFor(cwd = process.cwd(), env = process.env) {
@@ -320,7 +326,32 @@ export function finishTask(state, id, { status, error = null, findingsCount = nu
 }
 
 // 去重/冷却判定：同哈希在审 → 跳；同哈希 recently done → 冷却跳；同哈希 recently failed → 短冷却跳；否则审
+// 在途判定有时效（Bugbot #34b4c951）：钩子进程死于审阅中途（宿主超时杀钩子/Esc/崩溃/断电）会留下
+// 永远 reviewing 的任务，把同一回答的自动审阅永久堵死。陈旧任务一律标记 failed（放行重审），不视为在途。
+export function staleReviewTtlMs(config) {
+  return Math.max(config.reviewTimeoutMs || 120000, 60000) + 60000;
+}
+
+// 把超过时效的 reviewing 任务标记为 failed；返回清理数量（幂等，可重复调用）
+export function sweepStaleReviewing(state, config, now = Date.now()) {
+  const ttl = staleReviewTtlMs(config);
+  let swept = 0;
+  for (const t of Object.values(state.tasks)) {
+    if (t.status !== "reviewing") continue;
+    const started = Date.parse(t.startedAt);
+    const age = Number.isFinite(started) ? now - started : Infinity;
+    if (age >= ttl) {
+      t.status = "failed";
+      t.error = "stale reviewing task — hook process died mid-review";
+      t.finishedAt = new Date(now).toISOString();
+      swept++;
+    }
+  }
+  return swept;
+}
+
 export function shouldReview(state, { answerHash: hash, sessionId = null }, config) {
+  sweepStaleReviewing(state, config); // 在途判定前先清陈旧（幂等）
   for (const t of Object.values(state.tasks)) {
     if (t.status === "reviewing" && t.answerHash === hash && (!sessionId || !t.sessionId || t.sessionId === sessionId)) {
       return { review: false, reason: "same answer in-flight" };

